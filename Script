@@ -1,0 +1,930 @@
+--[[
+  BEAT BOUNCE · BBX v1.0   (Delta / most executors)
+  Game: BEAT BOUNCE (GEOMETRY DASH) - place 15598056478
+  RightShift (or the round "BB" button) shows/hides the menu.
+
+  I can't see the game's real code, so detection is keyword/heuristic based.
+  Open the Scan tab, press the scan buttons, and edit the keyword boxes
+  to match what the level parts are really called.
+]]
+
+if getgenv and getgenv().BBX_UNLOAD then pcall(getgenv().BBX_UNLOAD) end
+
+---------------------------------------------------------------- services
+local cloneref = cloneref or function(x) return x end
+local function svc(n)
+	local ok, s = pcall(function() return cloneref(game:GetService(n)) end)
+	return ok and s or nil
+end
+local Players, RunService, UIS = svc("Players"), svc("RunService"), svc("UserInputService")
+local Workspace, Lighting, CoreGui = svc("Workspace"), svc("Lighting"), svc("CoreGui")
+local TeleportService, HttpService = svc("TeleportService"), svc("HttpService")
+local VIM, VirtualUser, RepStorage = svc("VirtualInputManager"), svc("VirtualUser"), svc("ReplicatedStorage")
+local LP = Players.LocalPlayer
+local function cam() return Workspace.CurrentCamera end
+
+local alive = true
+local conns = {}
+local function connect(sig, fn)
+	local c = sig:Connect(fn)
+	conns[#conns + 1] = c
+	return c
+end
+
+---------------------------------------------------------------- state
+local S = {
+	-- auto play
+	autoJump = false, method = "Click", reaction = 0.30, minLook = 12, maxLook = 70,
+	cooldown = 0.18, boxW = 6, boxH = 6, gapJump = true, gapLook = 14, airJump = false,
+	aggressive = true, autoRespawn = true, stuckRespawn = true, hold = false,
+	autoClick = false, cps = 12,
+	-- player
+	neutralize = false, neutQuery = false, god = false, noclip = false,
+	fly = false, flySpeed = 70, infJump = false, mods = false, walk = 16, jump = 50, grav = 196.2,
+	-- level
+	retain = false, autoFinish = false,
+	-- visuals
+	esp = false, espRange = 250, espK = { hazard = true, orb = true, finish = true, coin = true },
+	fovOn = false, fov = 70, fullbright = false, nofog = false,
+	-- scan
+	spy = false,
+}
+
+local KW = {
+	hazard = { "spike", "saw", "hazard", "kill", "death", "lava", "damage", "thorn", "trap", "laser", "deadly", "blade", "obstacle" },
+	orb    = { "orb", "pad", "ring", "portal", "boost", "trigger" },
+	finish = { "finish", "goal", "endwall", "endportal", "complete", "victory", "winpart", "=end", "=win", "flag" },
+	coin   = { "coin", "star", "secret", "gem", "collect" },
+}
+
+---------------------------------------------------------------- log
+local logLines, logLabel = {}, nil
+local function log(...)
+	local parts = {}
+	for i, v in ipairs({ ... }) do parts[i] = tostring(v) end
+	local s = table.concat(parts, " ")
+	logLines[#logLines + 1] = s
+	if #logLines > 120 then table.remove(logLines, 1) end
+	if logLabel then logLabel.Text = table.concat(logLines, "\n") end
+end
+
+---------------------------------------------------------------- helpers
+local function getHum() local c = LP.Character return c and c:FindFirstChildOfClass("Humanoid") end
+local function getRoot()
+	local c = LP.Character
+	return c and (c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart)
+end
+
+local function hit(name, list)
+	name = name:lower()
+	for _, k in ipairs(list) do
+		if k:sub(1, 1) == "=" then
+			if name == k:sub(2) then return true end
+		elseif name:find(k, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local cache = setmetatable({}, { __mode = "k" })
+local function clearCache() for k in pairs(cache) do cache[k] = nil end end
+
+local function classify(p)
+	local c = cache[p]
+	if c ~= nil then return c or nil end
+	local kind
+	local inst, depth = p, 0
+	while inst and inst ~= Workspace and depth < 3 do
+		local n = inst.Name
+		if hit(n, KW.finish) then kind = "finish" break
+		elseif hit(n, KW.hazard) then kind = "hazard" break
+		elseif hit(n, KW.orb) then kind = "orb" break
+		elseif hit(n, KW.coin) then kind = "coin" break end
+		inst = inst.Parent
+		depth += 1
+	end
+	if not kind and S.aggressive then
+		local ok, t = pcall(function() return p:FindFirstChildWhichIsA("TouchTransmitter") end)
+		if ok and t then kind = "hazard" end
+	end
+	cache[p] = kind or false
+	return kind
+end
+
+---------------------------------------------------------------- input
+local function mouseSet(down)
+	local v = cam().ViewportSize
+	if VIM and pcall(function() VIM:SendMouseButtonEvent(v.X * 0.5, v.Y * 0.5, 0, down, game, 0) end) then return end
+	pcall(function() if down then mouse1press() else mouse1release() end end)
+end
+local function keySet(key, down)
+	pcall(function() VIM:SendKeyEvent(down, key, false, game) end)
+end
+local function pressR()
+	keySet(Enum.KeyCode.R, true)
+	task.wait(0.05)
+	keySet(Enum.KeyCode.R, false)
+end
+local function tap()
+	local m = S.method
+	if m == "Click" then
+		mouseSet(true) task.wait(0.03) mouseSet(false)
+	elseif m == "Space" then
+		keySet(Enum.KeyCode.Space, true) task.wait(0.03) keySet(Enum.KeyCode.Space, false)
+	else
+		local h = getHum()
+		if h then h.Jump = true pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end) end
+	end
+end
+local function doJump() task.spawn(tap) end
+
+---------------------------------------------------------------- auto jump (bot)
+local lastJump = 0
+local rpDown = RaycastParams.new()
+rpDown.FilterType = Enum.RaycastFilterType.Exclude
+local op = OverlapParams.new()
+op.FilterType = Enum.RaycastFilterType.Exclude
+
+connect(RunService.Heartbeat, function()
+	if not S.autoJump then return end
+	local char, root, hum = LP.Character, getRoot(), getHum()
+	if not (char and root) then return end
+	local now = os.clock()
+	if now - lastJump < S.cooldown then return end
+	rpDown.FilterDescendantsInstances = { char }
+	op.FilterDescendantsInstances = { char }
+
+	local onGround = (hum and hum.FloorMaterial ~= Enum.Material.Air)
+		or Workspace:Raycast(root.Position, Vector3.new(0, -5, 0), rpDown) ~= nil
+	if not onGround and not S.airJump then return end
+
+	local v = root.AssemblyLinearVelocity
+	local flat = Vector3.new(v.X, 0, v.Z)
+	local speed = flat.Magnitude
+	local dir
+	if speed > 3 then
+		dir = flat.Unit
+	else
+		local lv = root.CFrame.LookVector
+		dir = Vector3.new(lv.X, 0, lv.Z)
+		if dir.Magnitude < 0.01 then return end
+		dir = dir.Unit
+	end
+
+	local look = math.clamp(speed * S.reaction, S.minLook, S.maxLook)
+	local center = root.Position + dir * (look * 0.5 + 2) + Vector3.new(0, 0.5, 0)
+	local parts = Workspace:GetPartBoundsInBox(CFrame.lookAt(center, center + dir), Vector3.new(S.boxW, S.boxH, look), op)
+	local danger = false
+	for _, p in ipairs(parts) do
+		if classify(p) == "hazard" and (p.Position.Y + p.Size.Y * 0.5) > root.Position.Y - 2.5 then
+			danger = true
+			break
+		end
+	end
+	if not danger and S.gapJump and onGround then
+		local probe = root.Position + dir * math.max(S.gapLook, speed * 0.15)
+		if not Workspace:Raycast(probe, Vector3.new(0, -25, 0), rpDown) then danger = true end
+	end
+	if danger then
+		lastJump = now
+		doJump()
+	end
+end)
+
+-- auto click (spam) loop
+task.spawn(function()
+	while alive do
+		if S.autoClick then
+			tap()
+			task.wait(1 / math.max(S.cps, 1))
+		else
+			task.wait(0.2)
+		end
+	end
+end)
+
+local function setHold(on)
+	if on then
+		if S.method == "Space" then keySet(Enum.KeyCode.Space, true) else mouseSet(true) end
+	else
+		keySet(Enum.KeyCode.Space, false)
+		mouseSet(false)
+	end
+end
+
+---------------------------------------------------------------- respawn / stuck
+local savedCF
+local function hookChar(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum or not alive then return end
+	hum.Died:Connect(function()
+		if alive and S.autoRespawn then
+			task.wait(0.35)
+			pressR()
+		end
+	end)
+	if S.god then pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false) end) end
+	if S.retain and savedCF then
+		local r = char:WaitForChild("HumanoidRootPart", 5)
+		if r then task.wait(0.2) r.CFrame = savedCF end
+	end
+end
+
+task.spawn(function()
+	local stuck = 0
+	while alive do
+		task.wait(0.25)
+		local r = getRoot()
+		if S.stuckRespawn and S.autoJump and r then
+			if r.AssemblyLinearVelocity.Magnitude < 1.5 then stuck += 0.25 else stuck = 0 end
+			if stuck >= 2 then
+				stuck = 0
+				pressR()
+			end
+		else
+			stuck = 0
+		end
+	end
+end)
+
+---------------------------------------------------------------- player mods
+local touchBackup = setmetatable({}, { __mode = "k" })
+local neutConn
+local function neutralizePart(p)
+	pcall(function()
+		if p:IsA("BasePart") and classify(p) == "hazard" and not (LP.Character and p:IsDescendantOf(LP.Character)) then
+			if touchBackup[p] == nil then touchBackup[p] = { p.CanTouch, p.CanQuery } end
+			p.CanTouch = false
+			if S.neutQuery then p.CanQuery = false end
+		end
+	end)
+end
+local function setNeutralize(on)
+	if neutConn then neutConn:Disconnect() neutConn = nil end
+	if on then
+		task.spawn(function()
+			for i, d in ipairs(Workspace:GetDescendants()) do
+				neutralizePart(d)
+				if i % 1500 == 0 then task.wait() end
+			end
+		end)
+		neutConn = Workspace.DescendantAdded:Connect(function(d) task.defer(neutralizePart, d) end)
+	else
+		for p, v in pairs(touchBackup) do
+			pcall(function() p.CanTouch = v[1] p.CanQuery = v[2] end)
+			touchBackup[p] = nil
+		end
+	end
+end
+
+connect(RunService.Heartbeat, function()
+	if S.god then
+		local h = getHum()
+		if h and h.Health < h.MaxHealth then h.Health = h.MaxHealth end
+	end
+	if S.mods then
+		local h = getHum()
+		if h then
+			h.WalkSpeed = S.walk
+			h.UseJumpPower = true
+			h.JumpPower = S.jump
+		end
+		Workspace.Gravity = S.grav
+	end
+end)
+
+connect(RunService.Stepped, function()
+	if S.noclip and LP.Character then
+		for _, p in ipairs(LP.Character:GetDescendants()) do
+			if p:IsA("BasePart") then p.CanCollide = false end
+		end
+	end
+end)
+
+connect(RunService.RenderStepped, function()
+	if S.fovOn then cam().FieldOfView = S.fov end
+	if S.fly then
+		local r, h = getRoot(), getHum()
+		if not (r and h) then return end
+		local lv = cam().CFrame.LookVector
+		local md = h.MoveDirection
+		local dir = Vector3.zero
+		if md.Magnitude > 0 then
+			local flat = Vector3.new(lv.X, 0, lv.Z)
+			local fwd = flat.Magnitude > 0 and md:Dot(flat.Unit) or 0
+			dir = md + Vector3.new(0, lv.Y * math.max(fwd, 0), 0)
+		end
+		if UIS:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.new(0, 1, 0) end
+		if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.new(0, 1, 0) end
+		r.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * S.flySpeed or Vector3.zero
+	end
+end)
+
+connect(UIS.JumpRequest, function()
+	if S.infJump then
+		local h = getHum()
+		if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+	end
+end)
+
+---------------------------------------------------------------- level tools
+local function findFinish()
+	local root = getRoot()
+	if not root then return end
+	local best, bd
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("BasePart") and classify(d) == "finish" then
+			local dist = (d.Position - root.Position).Magnitude
+			if not bd or dist < bd then best, bd = d, dist end
+		end
+	end
+	return best
+end
+
+local function touchFinish(f)
+	local r = getRoot()
+	if r and f and firetouchinterest then
+		pcall(function() firetouchinterest(r, f, 0) task.wait() firetouchinterest(r, f, 1) end)
+	end
+end
+
+local function tpFinish()
+	local f, r = findFinish(), getRoot()
+	if f and r then
+		r.CFrame = f.CFrame * CFrame.new(0, f.Size.Y * 0.5 + 3, 0)
+		touchFinish(f)
+		log("[level] teleported to", f:GetFullName())
+	else
+		log("[level] no finish part found - check Scan tab keywords")
+	end
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(1)
+		if S.autoFinish then
+			local f = findFinish()
+			if f then touchFinish(f) end
+		end
+	end
+end)
+
+---------------------------------------------------------------- visuals
+local origLight = {}
+local function setFullbright(on)
+	if on then
+		origLight.fb = { Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows, Lighting.Ambient, Lighting.OutdoorAmbient }
+		Lighting.Brightness = 2
+		Lighting.ClockTime = 14
+		Lighting.GlobalShadows = false
+		Lighting.Ambient = Color3.new(1, 1, 1)
+		Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+	elseif origLight.fb then
+		local o = origLight.fb
+		Lighting.Brightness, Lighting.ClockTime, Lighting.GlobalShadows, Lighting.Ambient, Lighting.OutdoorAmbient = o[1], o[2], o[3], o[4], o[5]
+		origLight.fb = nil
+	end
+end
+local function setNoFog(on)
+	if on then
+		origLight.fog = Lighting.FogEnd
+		Lighting.FogEnd = 1e9
+	elseif origLight.fog then
+		Lighting.FogEnd = origLight.fog
+		origLight.fog = nil
+	end
+end
+local function fpsBoost()
+	task.spawn(function()
+		pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+		Lighting.GlobalShadows = false
+		for _, e in ipairs(Lighting:GetChildren()) do
+			if e:IsA("PostEffect") or e:IsA("Atmosphere") then pcall(function() e.Enabled = false end) end
+		end
+		for i, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") then
+				pcall(function() d.Enabled = false end)
+			end
+			if i % 1500 == 0 then task.wait() end
+		end
+		log("[fps] boost applied")
+	end)
+end
+
+-- ESP
+local guiParent
+do
+	local ok, h = pcall(function() return gethui and gethui() end)
+	if ok and h then
+		guiParent = h
+	elseif pcall(function() return CoreGui.Name end) then
+		guiParent = CoreGui
+	else
+		guiParent = LP:WaitForChild("PlayerGui")
+	end
+end
+
+local espHost = Instance.new("Folder")
+espHost.Name = "BBX_ESP"
+espHost.Parent = guiParent
+local esp = {}
+local COL = {
+	hazard = Color3.fromRGB(255, 60, 60), orb = Color3.fromRGB(60, 220, 255),
+	finish = Color3.fromRGB(255, 215, 0), coin = Color3.fromRGB(255, 170, 40),
+}
+local function espClear()
+	for p, a in pairs(esp) do a:Destroy() esp[p] = nil end
+end
+task.spawn(function()
+	local eop = OverlapParams.new()
+	eop.FilterType = Enum.RaycastFilterType.Exclude
+	eop.MaxParts = 600
+	while alive do
+		task.wait(0.5)
+		if S.esp then
+			local root = getRoot()
+			if root then
+				eop.FilterDescendantsInstances = { LP.Character }
+				local seen = {}
+				for _, p in ipairs(Workspace:GetPartBoundsInRadius(root.Position, S.espRange, eop)) do
+					local k = classify(p)
+					if k and S.espK[k] then
+						seen[p] = true
+						if not esp[p] then
+							local a = Instance.new("BoxHandleAdornment")
+							a.Adornee = p
+							a.AlwaysOnTop = true
+							a.ZIndex = 5
+							a.Size = p.Size
+							a.Transparency = 0.55
+							a.Color3 = COL[k]
+							a.Parent = espHost
+							esp[p] = a
+						end
+					end
+				end
+				for p, a in pairs(esp) do
+					if not seen[p] then a:Destroy() esp[p] = nil end
+				end
+			end
+		elseif next(esp) then
+			espClear()
+		end
+	end
+end)
+
+---------------------------------------------------------------- scanners
+local function copyLog()
+	local ok = pcall(function() setclipboard(table.concat(logLines, "\n")) end)
+	log(ok and "[log] copied to clipboard" or "[log] setclipboard not supported")
+end
+
+local function scanRemotes()
+	log("---- remotes in ReplicatedStorage ----")
+	local n = 0
+	for _, d in ipairs(RepStorage:GetDescendants()) do
+		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
+			n += 1
+			log(d.ClassName .. ": " .. d:GetFullName())
+		end
+	end
+	log("total:", n)
+end
+
+local function scanParts()
+	log("---- level scan ----")
+	local touch, kinds = {}, { hazard = 0, orb = 0, finish = 0, coin = 0 }
+	for i, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local k = classify(d)
+			if k then kinds[k] += 1 end
+			local ok, t = pcall(function() return d:FindFirstChildWhichIsA("TouchTransmitter") end)
+			if ok and t then touch[d.Name] = (touch[d.Name] or 0) + 1 end
+		end
+		if i % 1500 == 0 then task.wait() end
+	end
+	log(("classified: hazard=%d orb=%d finish=%d coin=%d"):format(kinds.hazard, kinds.orb, kinds.finish, kinds.coin))
+	local arr = {}
+	for n, c in pairs(touch) do arr[#arr + 1] = { n, c } end
+	table.sort(arr, function(a, b) return a[2] > b[2] end)
+	log("parts with TouchInterest (name x count):")
+	for i = 1, math.min(#arr, 40) do log("  " .. arr[i][1] .. " x" .. arr[i][2]) end
+	local names = {}
+	for _, c in ipairs(Workspace:GetChildren()) do
+		if not c:IsA("Terrain") and c ~= cam() then names[#names + 1] = c.Name end
+	end
+	log("Workspace children: " .. table.concat(names, ", "))
+	local r = getRoot()
+	if r then log("player root:", r:GetFullName()) end
+end
+
+local spyHooked = false
+local function enableSpy()
+	if spyHooked then return true end
+	if not (hookmetamethod and getnamecallmethod) then
+		log("[spy] hookmetamethod not supported by this executor")
+		return false
+	end
+	local old
+	old = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+		local m = getnamecallmethod()
+		if S.spy and (m == "FireServer" or m == "InvokeServer") then
+			local args = { ... }
+			task.defer(function()
+				local ok, name = pcall(function() return self:GetFullName() end)
+				local a = {}
+				for i = 1, math.min(#args, 4) do a[i] = tostring(args[i]) end
+				log("[spy]", m, ok and name or "?", "(" .. table.concat(a, ", ") .. ")")
+			end)
+		end
+		return old(self, ...)
+	end))
+	spyHooked = true
+	return true
+end
+
+---------------------------------------------------------------- misc
+connect(LP.Idled, function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end)
+
+local function serverHop()
+	local ok = pcall(function()
+		local res = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+		local data = HttpService:JSONDecode(res)
+		for _, s in ipairs(data.data or {}) do
+			if s.id ~= game.JobId and s.playing < s.maxPlayers then
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, LP)
+				return
+			end
+		end
+		log("[hop] no other server found")
+	end)
+	if not ok then log("[hop] failed (HttpGet unsupported?)") end
+end
+
+---------------------------------------------------------------- UI
+local THEME = {
+	bg = Color3.fromRGB(16, 16, 24), panel = Color3.fromRGB(28, 28, 42), accent = Color3.fromRGB(0, 200, 255),
+	text = Color3.fromRGB(235, 235, 245), dim = Color3.fromRGB(150, 150, 170), off = Color3.fromRGB(55, 55, 75),
+}
+local function new(class, props, parent)
+	local i = Instance.new(class)
+	for k, v in pairs(props) do i[k] = v end
+	if parent then i.Parent = parent end
+	return i
+end
+local function corner(o, r) new("UICorner", { CornerRadius = UDim.new(0, r or 6) }, o) end
+
+local old = guiParent:FindFirstChild("BBX_GUI")
+if old then old:Destroy() end
+local gui = new("ScreenGui", { Name = "BBX_GUI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999 })
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+gui.Parent = guiParent
+
+local vp = cam().ViewportSize
+local W, H = math.min(540, vp.X - 20), math.min(350, vp.Y - 20)
+local win = new("Frame", {
+	Size = UDim2.fromOffset(W, H), Position = UDim2.new(0.5, -W / 2, 0.5, -H / 2),
+	BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Active = true,
+}, gui)
+corner(win, 10)
+
+local title = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = THEME.panel, BorderSizePixel = 0, Active = true }, win)
+corner(title, 10)
+new("TextLabel", {
+	Size = UDim2.new(1, -80, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
+	Text = "BEAT BOUNCE  |  BBX v1.0", TextColor3 = THEME.text, Font = Enum.Font.GothamBold,
+	TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+}, title)
+
+local body = new("Frame", { Size = UDim2.new(1, 0, 1, -34), Position = UDim2.fromOffset(0, 34), BackgroundTransparency = 1 }, win)
+
+local function titleBtn(txt, x, cb)
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, x, 0, 5), BackgroundColor3 = THEME.off,
+		Text = txt, TextColor3 = THEME.text, Font = Enum.Font.GothamBold, TextSize = 13, AutoButtonColor = true,
+	}, title)
+	corner(b, 5)
+	b.MouseButton1Click:Connect(cb)
+end
+titleBtn("-", -62, function() body.Visible = not body.Visible end)
+titleBtn("X", -32, function() win.Visible = false end)
+
+-- dragging
+do
+	local dragging, startIn, startPos
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startIn, startPos = true, i.Position, win.Position
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end)
+end
+
+local tabsFrame = new("ScrollingFrame", {
+	Size = UDim2.new(0, 104, 1, -6), Position = UDim2.fromOffset(6, 0), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 0, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, body)
+new("UIListLayout", { Padding = UDim.new(0, 4) }, tabsFrame)
+local content = new("Frame", {
+	Size = UDim2.new(1, -118, 1, -6), Position = UDim2.fromOffset(112, 0), BackgroundTransparency = 1,
+}, body)
+
+local pages, tabBtns = {}, {}
+local function showPage(n)
+	for k, p in pairs(pages) do p.Visible = (k == n) end
+	for k, b in pairs(tabBtns) do
+		b.BackgroundColor3 = (k == n) and THEME.accent or THEME.panel
+		b.TextColor3 = (k == n) and Color3.new(0, 0, 0) or THEME.text
+	end
+end
+local function addPage(n)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = THEME.panel, Text = n, Font = Enum.Font.GothamMedium,
+		TextSize = 13, TextColor3 = THEME.text, AutoButtonColor = false,
+	}, tabsFrame)
+	corner(b, 6)
+	local p = new("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false,
+	}, content)
+	new("UIListLayout", { Padding = UDim.new(0, 5) }, p)
+	new("UIPadding", { PaddingRight = UDim.new(0, 6) }, p)
+	pages[n], tabBtns[n] = p, b
+	b.MouseButton1Click:Connect(function() showPage(n) end)
+	return p
+end
+
+local function runCb(cb, ...)
+	local args = { ... }
+	task.spawn(function()
+		local ok, e = pcall(cb, table.unpack(args))
+		if not ok then log("[err]", e) end
+	end)
+end
+
+local function toggle(page, text, default, cb)
+	local r = new("TextButton", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = THEME.panel, BorderSizePixel = 0, Text = "", AutoButtonColor = false }, page)
+	corner(r, 6)
+	new("TextLabel", {
+		Size = UDim2.new(1, -56, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1, Text = text,
+		TextColor3 = THEME.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, r)
+	local box = new("Frame", { Size = UDim2.fromOffset(34, 16), Position = UDim2.new(1, -44, 0.5, -8), BackgroundColor3 = THEME.off, BorderSizePixel = 0 }, r)
+	corner(box, 8)
+	local dot = new("Frame", { Size = UDim2.fromOffset(12, 12), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, box)
+	corner(dot, 6)
+	local state = false
+	local function set(v)
+		state = v
+		box.BackgroundColor3 = v and THEME.accent or THEME.off
+		dot.Position = v and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2)
+		runCb(cb, v)
+	end
+	r.MouseButton1Click:Connect(function() set(not state) end)
+	if default then set(true) end
+	return set
+end
+
+local function slider(page, text, min, max, default, step, cb)
+	local r = new("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = THEME.panel, BorderSizePixel = 0 }, page)
+	corner(r, 6)
+	local l = new("TextLabel", {
+		Size = UDim2.new(1, -12, 0, 18), Position = UDim2.fromOffset(10, 3), BackgroundTransparency = 1,
+		TextColor3 = THEME.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+	}, r)
+	local bar = new("TextButton", {
+		Size = UDim2.new(1, -20, 0, 8), Position = UDim2.new(0, 10, 0, 27), BackgroundColor3 = THEME.off,
+		BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+	}, r)
+	corner(bar, 4)
+	local fill = new("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = THEME.accent, BorderSizePixel = 0 }, bar)
+	corner(fill, 4)
+	local dragging = false
+	local function setv(v, silent)
+		v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+		fill.Size = UDim2.fromScale((v - min) / (max - min), 1)
+		l.Text = text .. ": " .. tostring(math.floor(v * 1000 + 0.5) / 1000)
+		if not silent then pcall(cb, v) end
+	end
+	local function fromX(x) setv(min + (max - min) * math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)) end
+	bar.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			fromX(i.Position.X)
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then fromX(i.Position.X) end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end)
+	setv(default, true)
+end
+
+local function button(page, text, cb)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = THEME.off, BorderSizePixel = 0, Text = text,
+		TextColor3 = THEME.text, Font = Enum.Font.GothamMedium, TextSize = 12, AutoButtonColor = true,
+	}, page)
+	corner(b, 6)
+	b.MouseButton1Click:Connect(function() runCb(cb) end)
+	return b
+end
+
+local function textbox(page, text, default, cb)
+	local r = new("Frame", { Size = UDim2.new(1, 0, 0, 50), BackgroundColor3 = THEME.panel, BorderSizePixel = 0 }, page)
+	corner(r, 6)
+	new("TextLabel", {
+		Size = UDim2.new(1, -12, 0, 16), Position = UDim2.fromOffset(10, 3), BackgroundTransparency = 1, Text = text,
+		TextColor3 = THEME.dim, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+	}, r)
+	local tb = new("TextBox", {
+		Size = UDim2.new(1, -20, 0, 24), Position = UDim2.fromOffset(10, 22), BackgroundColor3 = THEME.off, BorderSizePixel = 0,
+		Text = default, ClearTextOnFocus = false, TextColor3 = THEME.text, Font = Enum.Font.Code, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, r)
+	corner(tb, 5)
+	tb.FocusLost:Connect(function() runCb(cb, tb.Text) end)
+end
+
+local function label(page, text)
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = text,
+		TextColor3 = THEME.dim, Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+end
+
+-- pages
+local pAuto, pPlayer, pLevel = addPage("Auto Play"), addPage("Player"), addPage("Level")
+local pVis, pScan, pMisc = addPage("Visuals"), addPage("Scan"), addPage("Misc")
+
+---- Auto Play
+label(pAuto, "Bot that jumps for you when a hazard (or a gap) is ahead. Tune the sliders per level speed.")
+toggle(pAuto, "Auto Jump (bot)", false, function(v) S.autoJump = v end)
+local mbtn
+mbtn = button(pAuto, "Jump input: Click  (tap to change)", function()
+	local order = { "Click", "Space", "Humanoid" }
+	S.method = order[(table.find(order, S.method) or 1) % #order + 1]
+	mbtn.Text = "Jump input: " .. S.method .. "  (tap to change)"
+end)
+slider(pAuto, "Reaction time (s)", 0.05, 0.8, S.reaction, 0.01, function(v) S.reaction = v end)
+slider(pAuto, "Min look-ahead (studs)", 4, 40, S.minLook, 1, function(v) S.minLook = v end)
+slider(pAuto, "Max look-ahead (studs)", 20, 150, S.maxLook, 1, function(v) S.maxLook = v end)
+slider(pAuto, "Jump cooldown (s)", 0.05, 0.6, S.cooldown, 0.01, function(v) S.cooldown = v end)
+slider(pAuto, "Detect box width", 2, 20, S.boxW, 1, function(v) S.boxW = v end)
+slider(pAuto, "Detect box height", 2, 20, S.boxH, 1, function(v) S.boxH = v end)
+toggle(pAuto, "Jump over gaps", true, function(v) S.gapJump = v end)
+toggle(pAuto, "Allow air jumps (orbs / ship)", false, function(v) S.airJump = v end)
+toggle(pAuto, "Aggressive detect (any touch part = hazard)", true, function(v) S.aggressive = v clearCache() end)
+toggle(pAuto, "Auto respawn on death (R)", true, function(v) S.autoRespawn = v end)
+toggle(pAuto, "Respawn when stuck 2s (bot on)", true, function(v) S.stuckRespawn = v end)
+toggle(pAuto, "Hold input (ship / wave levels)", false, function(v) S.hold = v setHold(v) end)
+toggle(pAuto, "Auto clicker", false, function(v) S.autoClick = v end)
+slider(pAuto, "Clicks per second", 1, 40, S.cps, 1, function(v) S.cps = v end)
+
+---- Player
+label(pPlayer, "Hazard neutralizer + godmode only help if the game checks hazards on YOUR client. Test on a practice level.")
+toggle(pPlayer, "Neutralize hazards (CanTouch off)", false, function(v) S.neutralize = v setNeutralize(v) end)
+toggle(pPlayer, "  + also disable CanQuery (stronger)", false, function(v)
+	S.neutQuery = v
+	if S.neutralize then setNeutralize(false) setNeutralize(true) end
+end)
+toggle(pPlayer, "Godmode (humanoid)", false, function(v)
+	S.god = v
+	local h = getHum()
+	if h then pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Dead, not v) end) end
+end)
+toggle(pPlayer, "Noclip", false, function(v) S.noclip = v end)
+toggle(pPlayer, "Fly  (Space up / Ctrl down)", false, function(v)
+	S.fly = v
+	if not v then local r = getRoot() if r then r.AssemblyLinearVelocity = Vector3.zero end end
+end)
+slider(pPlayer, "Fly speed", 10, 300, S.flySpeed, 5, function(v) S.flySpeed = v end)
+toggle(pPlayer, "Infinite jump", false, function(v) S.infJump = v end)
+toggle(pPlayer, "Enable speed / jump / gravity mods", false, function(v)
+	S.mods = v
+	if not v then
+		Workspace.Gravity = 196.2
+		local h = getHum()
+		if h then h.WalkSpeed = 16 h.JumpPower = 50 end
+	end
+end)
+slider(pPlayer, "WalkSpeed", 16, 300, S.walk, 1, function(v) S.walk = v end)
+slider(pPlayer, "JumpPower", 25, 300, S.jump, 1, function(v) S.jump = v end)
+slider(pPlayer, "Gravity", 10, 400, S.grav, 1, function(v) S.grav = v end)
+
+---- Level
+label(pLevel, "Finish detection uses the 'finish' keywords from the Scan tab.")
+button(pLevel, "Save checkpoint (current position)", function()
+	local r = getRoot()
+	if r then savedCF = r.CFrame log("[level] checkpoint saved") end
+end)
+button(pLevel, "Teleport to checkpoint", function()
+	local r = getRoot()
+	if r and savedCF then r.CFrame = savedCF else log("[level] no checkpoint saved") end
+end)
+toggle(pLevel, "Return to checkpoint after respawn (practice)", false, function(v) S.retain = v end)
+button(pLevel, "Teleport to finish", tpFinish)
+toggle(pLevel, "Auto finish (firetouchinterest loop)", false, function(v) S.autoFinish = v end)
+
+---- Visuals
+toggle(pVis, "ESP (boxes)", false, function(v) S.esp = v end)
+toggle(pVis, "  hazards (red)", true, function(v) S.espK.hazard = v end)
+toggle(pVis, "  orbs / pads / portals (cyan)", true, function(v) S.espK.orb = v end)
+toggle(pVis, "  finish (gold)", true, function(v) S.espK.finish = v end)
+toggle(pVis, "  coins / secrets (orange)", true, function(v) S.espK.coin = v end)
+slider(pVis, "ESP range", 50, 600, S.espRange, 10, function(v) S.espRange = v end)
+toggle(pVis, "Custom FOV", false, function(v) S.fovOn = v end)
+slider(pVis, "FOV", 40, 120, S.fov, 1, function(v) S.fov = v end)
+toggle(pVis, "Fullbright", false, function(v) S.fullbright = v setFullbright(v) end)
+toggle(pVis, "No fog", false, function(v) S.nofog = v setNoFog(v) end)
+button(pVis, "FPS boost (disable effects)", fpsBoost)
+button(pVis, "Unlock camera zoom", function()
+	LP.CameraMaxZoomDistance = 1000
+	LP.CameraMinZoomDistance = 0.5
+end)
+
+---- Scan
+label(pScan, "Run these in a level, then press Copy log and send it to me - I can then tailor the script to the real names.")
+button(pScan, "Scan level parts", scanParts)
+button(pScan, "Scan remotes", scanRemotes)
+toggle(pScan, "Remote spy (log FireServer/InvokeServer)", false, function(v)
+	S.spy = v and enableSpy()
+	if v and not S.spy then log("[spy] could not enable") end
+end)
+button(pScan, "Copy log to clipboard", copyLog)
+button(pScan, "Clear log", function() logLines = {} logLabel.Text = "" end)
+for _, k in ipairs({ "hazard", "finish", "orb", "coin" }) do
+	textbox(pScan, k .. " keywords (comma separated, '=' = exact name)", table.concat(KW[k], ","), function(t)
+		local n = {}
+		for w in t:gmatch("[^,]+") do
+			w = w:match("^%s*(.-)%s*$"):lower()
+			if w ~= "" then n[#n + 1] = w end
+		end
+		KW[k] = n
+		clearCache()
+		log("[kw] " .. k .. " updated (" .. #n .. ")")
+	end)
+end
+logLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+	Text = "", TextColor3 = THEME.dim, Font = Enum.Font.Code, TextSize = 11, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+}, pScan)
+corner(logLabel, 6)
+
+---- Misc
+toggle(pMisc, "Anti-AFK", true, function() end)
+button(pMisc, "Rejoin server", function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP) end)
+button(pMisc, "Server hop", serverHop)
+button(pMisc, "Press R (respawn) now", function() pressR() end)
+label(pMisc, "Menu: RightShift or the round BB button.")
+
+local function unload()
+	alive = false
+	S.autoJump, S.autoClick, S.noclip, S.fly, S.spy, S.esp = false, false, false, false, false, false
+	setHold(false)
+	setNeutralize(false)
+	setFullbright(false)
+	setNoFog(false)
+	if S.mods then Workspace.Gravity = 196.2 end
+	espClear()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() espHost:Destroy() end)
+	pcall(function() gui:Destroy() end)
+	if getgenv then getgenv().BBX_UNLOAD = nil end
+end
+button(pMisc, "Unload script", unload)
+if getgenv then getgenv().BBX_UNLOAD = unload end
+
+-- floating toggle button + hotkey
+local fab = new("TextButton", {
+	Size = UDim2.fromOffset(38, 38), Position = UDim2.new(0, 10, 0.5, -19), BackgroundColor3 = THEME.accent,
+	Text = "BB", Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Color3.new(0, 0, 0),
+}, gui)
+corner(fab, 19)
+fab.MouseButton1Click:Connect(function() win.Visible = not win.Visible end)
+connect(UIS.InputBegan, function(i, gp)
+	if i.KeyCode == Enum.KeyCode.RightShift then win.Visible = not win.Visible end
+end)
+
+---------------------------------------------------------------- init
+showPage("Auto Play")
+if LP.Character then task.spawn(hookChar, LP.Character) end
+connect(LP.CharacterAdded, function(c) task.spawn(hookChar, c) end)
+log("BBX loaded. Use the Scan tab to check what the level parts are called.")
